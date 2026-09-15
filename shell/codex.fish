@@ -1,5 +1,5 @@
-# Put this in ~/.config/fish/config.fish (a function defined there wins over an autoloaded
-# functions/codex.fish, which matters if another codex wrapper already exists).
+# install.sh links this into ~/.config/fish/conf.d/. A `codex` function defined in your own
+# config.fish loads later and would replace it, so put any extra flags of yours in here.
 function codex --wraps codex
     if not command -q codex-switchboard
         command codex $argv

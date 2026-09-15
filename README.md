@@ -48,12 +48,13 @@ optional webhook gets a message then, and again when quota is back.
 
     git clone https://github.com/andylizf/codex-switchboard
     cd codex-switchboard
-    ln -s "$PWD/codex-acct" "$PWD/switchboard.py" ~/.local/bin/
-    mv ~/.local/bin/switchboard.py ~/.local/bin/codex-switchboard
+    ./install.sh
 
-Then the shell function: `shell/codex.fish` for fish, `shell/codex.bash` for bash and zsh.
-It sends the interactive TUI to the engine and every other subcommand (`exec`, `login`,
-`mcp`, ...) straight to the binary on the default account.
+That links `codex-switchboard` and `codex-acct` into `~/.local/bin` and installs a `codex`
+shell function for your shell, fish, bash or zsh, from `shell/`. The function sends the
+interactive TUI to the engine and every other subcommand, `exec`, `login`, `mcp` and the
+rest, straight to the binary on the default account. Re-run `./install.sh` after a
+`git pull`.
 
 Log the accounts in, one profile each. `default` is your existing `~/.codex` login; each
 further account gets its own directory under `~/.codex-profiles/`, holding only that
