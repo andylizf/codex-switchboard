@@ -29,7 +29,7 @@ Two rules decide the account:
   between turns, so a turn normally never hits the wall (`SWITCH_BELOW_PERCENT`).
 - Reactive: every 3 s it scans recently touched threads for a turn that failed with
   `usageLimitExceeded`. If one did, it switches and queues a continuation into that thread
-  (`thread/queue/add`, the API behind `codex queue`), so the work resumes without anything
+  via `thread/queue/add`, the API behind `codex queue`, so the work resumes without anything
   typed.
 
 When every account is out, the engine stays logged in on one that still authenticates, so
@@ -38,7 +38,7 @@ optional webhook gets a message then, and again when quota is back.
 
 ## Requirements
 
-- codex-cli 0.154 or later (verified on 0.154.0). The login mode this relies on,
+- codex-cli 0.154 or later, verified on 0.154.0. The login mode this relies on,
   `chatgptAuthTokens`, is the one the Codex desktop app uses; it is marked unstable in the
   protocol schema and needs the `experimentalApi` capability.
 - Python 3.10+, standard library only.
@@ -74,7 +74,7 @@ Optionally set the order, first preferred:
 
 Without the file the pool is `default` followed by every logged-in profile in name order.
 For alerts, put a Slack- or Feishu-style incoming-webhook URL in
-`~/.codex-profiles/pool/alert-webhook` (mode 0600).
+`~/.codex-profiles/pool/alert-webhook`, mode 0600.
 
 ## How it works
 
@@ -91,8 +91,8 @@ Three pieces, all on Codex's own ChatGPT auth path: no proxy, no relay, no API k
    code and stays single-copy per machine.
 3. TUI: `CODEX_HOME=~/.codex-profiles/pool codex --remote unix://`.
 
-State and logs live in `~/.codex-profiles/pool/`: `switchboard.log` (one JSON line per
-event), `engine.log` (app-server stderr), `switchboard-state.json`.
+State and logs live in `~/.codex-profiles/pool/`: `switchboard.log`, one JSON line per
+event; `engine.log`, the app-server's stderr; `switchboard-state.json`.
 
 ## The one thing to know: a thread pins the credential of its first turn
 
@@ -110,7 +110,7 @@ usage-limit message, and the switchboard queues the continuation, which reconnec
 current account. A thread started after the switch is on the new account from its first
 turn.
 
-Plain HTTP (a custom provider with `supports_websockets = false`) would remove the pin, but
+Plain HTTP, a custom provider with `supports_websockets = false`, would remove the pin, but
 it re-sends the whole context on every model call: measured at about one extra second per
 call with 80 KB of context in the thread, paid once per tool step. Too slow, so the
 websocket stays.
