@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+# codex-acct — switch between Codex (ChatGPT) accounts without logging anything out.
+#
+# Why this exists: Codex has no `setup-token` / `ANTHROPIC_AUTH_TOKEN` equivalent.
+# Verified against codex-cli 0.146.0:
+#   - CODEX_AUTH env var          -> ignored (agent-identity internals, not a token slot)
+#   - login --with-access-token   -> enterprise-only ("agent identity JWT payload is not valid JSON")
+#   - login --with-api-key        -> works, but bills API credits, not the ChatGPT subscription
+#   - CODEX_HOME                  -> works; relocates the whole .codex dir, auth.json included
+#
+# So each account gets its own CODEX_HOME. Everything except auth.json is symlinked back
+# to ~/.codex, so config.toml / AGENTS.md / skills / history stay shared.
+#
+# THE ONE RULE: never copy an account's auth.json to a second machine. Both copies share
+# one refresh token, it rotates on use, and the loser is logged out permanently
+# (openai/codex#19803, refresh_token_reused). Log in per machine instead — independently
+# logged-in machines coexist fine. This script refuses to import auth minted elsewhere.
+#
+# Usage:
+#   codex-acct ls                 list accounts, show which is active
+#   codex-acct import <name>      adopt the CURRENT ~/.codex login as a named account
+#   codex-acct login <name>       log a NEW account in, isolated (current login untouched)
+#   codex-acct use <name>         print the export line; in fish:  codex-acct use <name> | source
+#   codex-acct run <name> ...     run one codex command on that account, shell untouched
+#   codex-acct who                who is active in this shell
+#   codex-acct path <name>        print a profile's CODEX_HOME
+#   codex-acct reconcile <name>   rebuild a profile's symlink farm (the switchboard's pool
+#                                 dir is a profile with no auth.json; see codex-switchboard)
+#
+set -euo pipefail
+
+PROFILE_ROOT="${CODEX_ACCT_ROOT:-$HOME/.codex-profiles}"
+REAL_CODEX_HOME="$HOME/.codex"
+SELF_HOST="$(hostname -s)"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*" >&2; }
+
+# Everything in ~/.codex is shared except these — auth.json must stay per-account, and the
+# lock/tmp dirs are runtime state that must not be aliased between profiles.
+is_private() {
+  case "$1" in
+    # app-server-control is the engine's own socket dir (codex-switchboard); linking it
+    # into a profile would put that profile's engine socket inside ~/.codex.
+    auth.json|.tmp|tmp|ipc|app-server-control) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# SQLite sidecars are never linked. SQLite resolves the db symlink and writes -wal/-shm next
+# to the target in ~/.codex, so a link here is dead weight in the normal case — and fatal in
+# the one case that actually happened: codex ran under a profile before reconcile had linked
+# a newly added db (queue_1.sqlite), so it created that db as a real file in the
+# profile; the next reconcile then linked the sidecars to ~/.codex's, pairing a local db with
+# a foreign WAL index. Every codex start after that died with SQLITE_CANTOPEN (14).
+is_sqlite_sidecar() {
+  case "$1" in
+    *.sqlite-wal|*.sqlite-shm|*.sqlite-journal) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Rebuild the symlink farm: every ~/.codex entry except the private ones is linked into the
+# profile dir, so a profile sees the same config/skills/history as the real home. Re-run on
+# every use/login so entries added by a codex upgrade get picked up.
+reconcile() {
+  local dir="$1"
+  mkdir -p "$dir"
+  local entry base target
+  for entry in "$REAL_CODEX_HOME"/* "$REAL_CODEX_HOME"/.[!.]*; do
+    [ -e "$entry" ] || continue
+    base="$(basename "$entry")"
+    is_private "$base" && continue
+    is_sqlite_sidecar "$base" && continue
+    target="$dir/$base"
+    # Only ever manage symlinks; never clobber a real file living in the profile.
+    if [ -L "$target" ]; then
+      [ "$(readlink "$target")" = "$entry" ] || ln -sfn "$entry" "$target"
+    elif [ ! -e "$target" ]; then
+      ln -s "$entry" "$target"
+    else
+      # A real file where a link belongs: codex wrote it under the profile before this entry
+      # existed in ~/.codex. Harmless on its own, but the profile's copy has quietly stopped
+      # tracking the shared one, so say which file rather than leave the fork invisible.
+      note "codex-acct: $dir/$base is a real file, not shared with ~/.codex — diverging"
+    fi
+  done
+}
+
+# Decode the id_token payload to show who an auth.json belongs to. Read-only, no network.
+describe_auth() {
+  local f="$1"
+  [ -f "$f" ] || { printf 'no auth.json'; return; }
+  python3 - "$f" <<'PY' 2>/dev/null || printf 'unreadable'
+import json, base64, sys, datetime
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("unreadable"); raise SystemExit
+mode = d.get("auth_mode") or "?"
+tok = d.get("tokens") or {}
+idt = tok.get("id_token")
+if not idt:
+    print(f"{mode} (no id_token)"); raise SystemExit
+p = idt.split(".")[1]; p += "=" * (-len(p) % 4)
+try:
+    c = json.loads(base64.urlsafe_b64decode(p))
+except Exception:
+    print(f"{mode} (undecodable id_token)"); raise SystemExit
+auth = c.get("https://api.openai.com/auth", {})
+email = c.get("email", "?")
+plan = auth.get("chatgpt_plan_type", "?")
+exp = c.get("exp")
+state = ""
+if exp:
+    left = exp - datetime.datetime.now(datetime.timezone.utc).timestamp()
+    # The id_token expires well before the access_token (observed: id ~1 day, access ~10 days),
+    # so this is only a hint that a refresh is due, not that the account is unusable.
+    state = "  id_token expired (refreshes on use)" if left < 0 else ""
+print(f"{email}  [{plan}]  mode={mode}{state}")
+PY
+}
+
+# Just the account email from an auth.json, for detecting that two profiles ended up
+# holding the same account -- the usual cause is a device-auth code approved in a browser
+# still signed in as the previous account.
+email_of() {
+  local f="$1"
+  [ -f "$f" ] || return 0
+  python3 - "$f" <<'PY' 2>/dev/null
+import json, base64, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    p = d["tokens"]["id_token"].split(".")[1]; p += "=" * (-len(p) % 4)
+    print(json.loads(base64.urlsafe_b64decode(p)).get("email", ""))
+except Exception:
+    pass
+PY
+}
+
+# The machine that minted an auth.json, recorded at import/login time. Used to refuse
+# cross-machine reuse, which is what actually causes the "logged out on my other device" bug.
+origin_of() {
+  local d="$1"
+  [ -f "$d/.origin" ] && cat "$d/.origin" || printf 'unknown'
+}
+
+# `codex login` truncates auth.json *before* it opens the browser, so aborting at the
+# prompt destroys a working credential. Stash a copy first and put it back unless the
+# login actually produced a new one. Globals, because the trap fires after cmd_login's
+# locals are gone.
+_LOGIN_BACKUP=""
+_LOGIN_DIR=""
+
+arm_login_backup() {
+  local dir="$1"
+  [ -f "$dir/auth.json" ] || return 0
+  _LOGIN_DIR="$dir"
+  _LOGIN_BACKUP="$dir/.auth-pre-login"
+  cp -p "$dir/auth.json" "$_LOGIN_BACKUP"
+  chmod 600 "$_LOGIN_BACKUP"
+  trap restore_login_backup EXIT INT TERM
+}
+
+restore_login_backup() {
+  [ -n "$_LOGIN_BACKUP" ] && [ -f "$_LOGIN_BACKUP" ] || return 0
+  if [ -s "$_LOGIN_DIR/auth.json" ]; then
+    rm -f "$_LOGIN_BACKUP"          # new credential landed; drop the safety copy
+  else
+    mv "$_LOGIN_BACKUP" "$_LOGIN_DIR/auth.json"
+    note "login did not complete — restored the previous credential for '$(basename "$_LOGIN_DIR")'"
+  fi
+  _LOGIN_BACKUP=""
+}
+
+active_profile() {
+  local h="${CODEX_HOME:-}"
+  [ -n "$h" ] || { printf ''; return; }
+  case "$h" in
+    "$PROFILE_ROOT"/*) basename "$h" ;;
+    *) printf '' ;;
+  esac
+}
+
+cmd_ls() {
+  local act; act="$(active_profile)"
+  printf '%-3s %-14s %s\n' "" "NAME" "ACCOUNT"
+  # The plain ~/.codex login is a first-class account here, just not a managed profile.
+  local mark="  "
+  [ -z "$act" ] && [ -z "${CODEX_HOME:-}" ] && mark="=>"
+  printf '%-3s %-14s %s\n' "$mark" "default" "$(describe_auth "$REAL_CODEX_HOME/auth.json")"
+  local d name orig
+  if [ -d "$PROFILE_ROOT" ]; then
+    for d in "$PROFILE_ROOT"/*/; do
+      [ -d "$d" ] || continue
+      name="$(basename "$d")"
+      mark="  "
+      [ "$name" = "$act" ] && mark="=>"
+      if [ "$name" = "pool" ]; then
+        # The switchboard engine's home: credentials are handed to it at runtime, never stored.
+        printf '%-3s %-14s %s\n' "$mark" "$name" "(codex-switchboard engine pool, no stored credential)"
+        continue
+      fi
+      printf '%-3s %-14s %s\n' "$mark" "$name" "$(describe_auth "$d/auth.json")"
+      orig="$(origin_of "$d")"
+      [ "$orig" != "$SELF_HOST" ] && [ "$orig" != "unknown" ] && \
+        printf '%-3s %-14s   ^ minted on %s — do not use here, log in fresh instead\n' "" "" "$orig"
+    done
+  fi
+  if [ ! -d "$PROFILE_ROOT" ] || [ -z "$(ls -A "$PROFILE_ROOT" 2>/dev/null || true)" ]; then
+    note ""
+    note "no extra accounts yet.  add one:  codex-acct login <name>"
+  fi
+}
+
+# Deliberately a move, never a copy. Two files holding one refresh token log each other out
+# on first refresh — same failure as copying across machines, just with a shorter fuse.
+# You almost certainly do not need this: the default ~/.codex login already works as-is,
+# and extra accounts should come from `codex-acct login`.
+cmd_import() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: codex-acct import <name>"
+  [ -f "$REAL_CODEX_HOME/auth.json" ] || die "not logged in right now — nothing to import"
+  local dir="$PROFILE_ROOT/$name"
+  [ -e "$dir/auth.json" ] && die "'$name' already exists (its auth.json would be overwritten)"
+  note "This MOVES ~/.codex/auth.json into the '$name' profile."
+  note "Afterwards a bare \`codex\` is logged out until you run: codex-acct use $name | source"
+  note "Anything else on this machine reading ~/.codex (OpenClaw, IDE extension) loses its login too."
+  note "Ctrl-C to abort, Enter to continue."
+  read -r _
+  mkdir -p "$dir"
+  mv "$REAL_CODEX_HOME/auth.json" "$dir/auth.json"
+  chmod 600 "$dir/auth.json"
+  printf '%s\n' "$SELF_HOST" > "$dir/.origin"
+  reconcile "$dir"
+  note "imported '$name': $(describe_auth "$dir/auth.json")"
+}
+
+cmd_login() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: codex-acct login <name> [--device-auth]"
+  shift || true
+  local dir="$PROFILE_ROOT/$name"
+  if [ -f "$dir/auth.json" ]; then
+    note "'$name' is already logged in: $(describe_auth "$dir/auth.json")"
+    note "a copy is stashed first, so aborting this login restores it."
+  fi
+  reconcile "$dir"
+  arm_login_backup "$dir"
+  note "logging in under an isolated CODEX_HOME — your current login is not touched."
+  note "profile: $dir"
+  note ""
+  # The isolated CODEX_HOME is the whole point: this login writes only into the profile,
+  # so the account currently in ~/.codex keeps its own untouched refresh token.
+  local rc=0
+  CODEX_HOME="$dir" codex login "$@" || rc=$?
+  restore_login_backup
+  if [ "$rc" -ne 0 ] || [ ! -s "$dir/auth.json" ]; then
+    die "login did not complete (exit $rc) — any previous credential has been restored"
+  fi
+  chmod 600 "$dir/auth.json"
+  printf '%s\n' "$SELF_HOST" > "$dir/.origin"
+  note ""
+  note "logged in: $(describe_auth "$dir/auth.json")"
+
+  # Same-account check. Device-auth codes get approved in whatever browser session is
+  # already open, so landing on the account you meant to switch away from is easy to do
+  # and easy to miss -- two profiles, one account, no extra quota.
+  local new_email other other_email
+  new_email="$(email_of "$dir/auth.json")"
+  if [ -n "$new_email" ]; then
+    other_email="$(email_of "$REAL_CODEX_HOME/auth.json")"
+    if [ "$new_email" = "$other_email" ]; then
+      note ""
+      note "!! this is the SAME account as default ($new_email)"
+      note "   the browser that approved the code was still signed in as that account."
+      note "   sign in as the other account there, then re-run: codex-acct login $name"
+      return 1
+    fi
+    for other in "$PROFILE_ROOT"/*/; do
+      [ -d "$other" ] || continue
+      [ "$(basename "$other")" = "$name" ] && continue
+      if [ "$new_email" = "$(email_of "$other/auth.json")" ]; then
+        note ""
+        note "!! same account as profile '$(basename "$other")' ($new_email)"
+        return 1
+      fi
+    done
+    note "distinct account confirmed (default is $other_email)"
+  fi
+  note "activate with:  codex-acct use $name | source     (fish)"
+}
+
+cmd_use() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: codex-acct use <name|default>"
+  # "default" means the untouched ~/.codex login — just drop the override.
+  if [ "$name" = "default" ] || [ "$name" = "-" ]; then
+    printf 'set -e CODEX_HOME\n'
+    note "→ default: $(describe_auth "$REAL_CODEX_HOME/auth.json")"
+    return
+  fi
+  local dir="$PROFILE_ROOT/$name"
+  [ -f "$dir/auth.json" ] || die "'$name' has no auth.json — run: codex-acct login $name"
+  local orig; orig="$(origin_of "$dir")"
+  if [ "$orig" != "$SELF_HOST" ] && [ "$orig" != "unknown" ]; then
+    die "'$name' was minted on '$orig'. Using it here would rotate the refresh token and log
+       that machine out permanently. Run 'codex-acct login $name' to get fresh credentials."
+  fi
+  reconcile "$dir"
+  # Printed, not exported: a child process cannot mutate its parent shell. `| source` in
+  # fish, `eval $(...)` in bash/zsh — same shape as `export ANTHROPIC_AUTH_TOKEN`.
+  printf 'set -gx CODEX_HOME %s\n' "$dir"
+  note "→ $name: $(describe_auth "$dir/auth.json")"
+}
+
+# Run one codex command on an account without touching the shell.
+# `use` switches the whole shell and is easy to forget you are in;
+# this is per-invocation, so the account cannot outlive the command.
+#
+# The guard: `codex remote-control` registers this machine as an environment on whichever
+# account owns the credential, so a session started here would show up in that account's
+# web UI. For an account that is not the machine's main one that is a surprise nobody
+# wants, so `run` refuses that subcommand outright.
+#
+# It is refused rather than disabled by config because the `remote_control` feature flag
+# is at stage `removed` (`codex features list`) and no longer gates the subcommand, and
+# the only policy key that does, `allow_remote_control`, is read from
+# /etc/codex/managed_config.toml — machine-wide, so it would take the default account's
+# Remote Control down too.
+#
+# What is NOT a leak here, checked on codex-cli 0.153.4: session history stays local
+# (`experimental_thread_store_endpoint` is rejected as "no longer supported"; the thread
+# store is the local thread_history_1.sqlite), and a plain `codex` or `codex exec`
+# registers nothing — `GET https://chatgpt.com/backend-api/wham/environments` returns `[]`.
+guard_no_remote_control() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      remote-control)
+        die "refusing: 'codex remote-control' registers an environment on this account.
+       Run it on the default account instead (plain \`codex remote-control\`)." ;;
+      --remote|--remote-auth-token-env)
+        die "refusing: '$a' points the TUI at another app server; not through codex-acct run." ;;
+    esac
+  done
+}
+
+cmd_run() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: codex-acct run <name> [codex args...]"
+  shift || true
+  if [ "$name" = "default" ] || [ "$name" = "-" ]; then
+    exec env -u CODEX_HOME codex "$@"
+  fi
+  local dir="$PROFILE_ROOT/$name"
+  [ -f "$dir/auth.json" ] || die "'$name' has no auth.json — run: codex-acct login $name"
+  local orig; orig="$(origin_of "$dir")"
+  if [ "$orig" != "$SELF_HOST" ] && [ "$orig" != "unknown" ]; then
+    die "'$name' was minted on '$orig'. Using it here would rotate the refresh token and log
+       that machine out permanently. Run 'codex-acct login $name' to get fresh credentials."
+  fi
+  guard_no_remote_control "$@"
+  reconcile "$dir"
+  exec env CODEX_HOME="$dir" codex "$@"
+}
+
+cmd_who() {
+  local act; act="$(active_profile)"
+  if [ -n "$act" ]; then
+    printf '%s  (CODEX_HOME=%s)\n' "$(describe_auth "$PROFILE_ROOT/$act/auth.json")" "$CODEX_HOME"
+    printf 'account: %s\n' "$act"
+  elif [ -n "${CODEX_HOME:-}" ]; then
+    printf '%s  (CODEX_HOME=%s, not a managed profile)\n' "$(describe_auth "$CODEX_HOME/auth.json")" "$CODEX_HOME"
+  else
+    printf '%s  (default ~/.codex)\n' "$(describe_auth "$REAL_CODEX_HOME/auth.json")"
+  fi
+}
+
+cmd_reconcile() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: codex-acct reconcile <name>"
+  reconcile "$PROFILE_ROOT/$name"
+}
+
+cmd_path() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: codex-acct path <name>"
+  [ -d "$PROFILE_ROOT/$name" ] || die "no such account: $name"
+  printf '%s\n' "$PROFILE_ROOT/$name"
+}
+
+main() {
+  local cmd="${1:-ls}"; shift || true
+  case "$cmd" in
+    ls|list)   cmd_ls "$@" ;;
+    import)    cmd_import "$@" ;;
+    login|add) cmd_login "$@" ;;
+    use)       cmd_use "$@" ;;
+    run)       cmd_run "$@" ;;
+    who)       cmd_who "$@" ;;
+    path)      cmd_path "$@" ;;
+    reconcile) cmd_reconcile "$@" ;;
+    -h|--help|help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown command '$cmd' (try: ls, import, login, use, run, who, path, reconcile)" ;;
+  esac
+}
+
+main "$@"
